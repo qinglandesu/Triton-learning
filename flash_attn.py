@@ -74,6 +74,7 @@ def _attn_fwd_inner(
         for BLOCK_SIZE_KV in [16]#, 32, 64, 128]
         for num_stages in [3]#, 5, 7]
         for num_warps in [4]#, 8, 16]
+        if BLOCK_SIZE_QO % BLOCK_SIZE_KV == 0
     ],
     key=["Dh"],
 )
@@ -159,6 +160,274 @@ def attn_fwd(
     O_offsets = (offsets_QO_N[:, None] * stride_O_N + offsets_Dh[None, :] * stride_O_Dh)
     tl.store(O_ptr + O_offsets, O, mask=mask_QO_N[:,None]) # shape (BLOCK_SIZE_Q, Dh)
 
+@triton.autotune(
+    [
+        triton.Config({"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
+                        num_stages=num_stages, num_warps=num_warps,)
+        for PRE_BLOCK_SIZE_ROW in [32]#, 64, 128, 256]
+        for num_stages in [3]#, 5, 7]
+        for num_warps in [4]#, 8, 16]
+    ],
+    key=["Dh"],
+)
+@triton.jit
+def attn_backward_preprocess(
+    O_ptr, dLdO_ptr, Delta_ptr,
+    stride_O_B, stride_O_H, stride_O_N, stride_O_Dh,
+    stride_dLdO_B, stride_dLdO_H, stride_dLdO_N, stride_dLdO_Dh,
+    stride_Delta_B, stride_Delta_H, stride_Delta_N,
+    N, Dh: tl.constexpr,
+    PRE_BLOCK_SIZE_ROW: tl.constexpr,
+    ):
+    index_BH = tl.program_id(axis=1)
+    row = tl.program_id(axis=0)
+
+    row_offsets = row * PRE_BLOCK_SIZE_ROW + tl.arange(0, PRE_BLOCK_SIZE_ROW)
+    col_offsets = tl.arange(0, Dh)
+    mask = row_offsets < N
+
+    O_ptr += index_BH * stride_O_H
+    O_offsets = row_offsets[:,None] * stride_O_N + col_offsets[None,:] * stride_O_Dh
+    O = tl.load(O_ptr + O_offsets, mask=mask[:,None], other=0.0) # shape (PRE_BLOCK_SIZE_ROW, Dh)
+
+    dLdO_ptr += index_BH * stride_dLdO_H
+    dLdO_offsets = row_offsets[:,None] * stride_dLdO_N + col_offsets[None,:] * stride_dLdO_Dh
+    dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask[:,None], other=0.0) # shape (PRE_BLOCK_SIZE_ROW, Dh)
+
+    Delta = tl.sum(dLdO * O, axis=1) # size (PRE_BLOCK_SIZE_ROW)
+    Delta_ptr += index_BH * stride_Delta_H
+    tl.store(Delta_ptr + row_offsets, Delta, mask=mask)
+
+
+@triton.jit
+def _attn_bwd_KV(
+    K,V,dLdK,dLdV,
+    Q_ptr,dLdO_ptr,LSE_ptr,Delta_ptr,
+    stride_N,stride_Dh,
+    H, N, Dh: tl.constexpr,
+    BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_COL: tl.constexpr,
+    start_row, start_col, num_steps,
+    scale, ln2: tl.constexpr, rln2: tl.constexpr,
+    DIAGONAL: tl.constexpr,
+    ):
+    offsets_row = start_row + tl.arange(0, BLOCK_SIZE_ROW) # Q的token索引（Nq）
+    offsets_col = start_col + tl.arange(0, BLOCK_SIZE_COL) # K/V的token索引（Nk）
+    offsets_Dh = tl.arange(0, Dh)
+
+    Q_T_offsets = offsets_Dh[:,None] * stride_Dh + offsets_row[None,:] * stride_N
+    dLdO_offsets = offsets_row[:,None] * stride_N + offsets_Dh[None,:] * stride_Dh
+
+    for block_idx in range(num_steps):
+        mask_N = offsets_row < N
+        Q_T = tl.load(Q_ptr + Q_T_offsets, mask=mask_N[None,:], other=0.0) # shape (Dh, BLOCK_SIZE_ROW)
+        LSE = tl.load(LSE_ptr + offsets_row, mask=mask_N, other=0.0) # shape (BLOCK_SIZE_ROW)
+        dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask_N[:, None], other=0.0) # shape (BLOCK_SIZE_ROW, Dh)
+        Delta = tl.load(Delta_ptr + offsets_row, mask=mask_N, other=0.0) # shape (BLOCK_SIZE_ROW)
+
+        S_T = tl.dot(K, Q_T) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        P_T = tl.exp2(S_T - LSE[None,:]) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+
+        if DIAGONAL:
+            mask = (offsets_col[:,None] <= offsets_row[None,:])
+            P_T = tl.where(mask, P_T, 0.0)
+
+        dLdV = tl.dot(P_T, dLdO, acc=dLdV) # (BLOCK_SIZE_COL, Dh)
+        dLdP_T = tl.dot(V, tl.trans(dLdO)) # (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdS_T = (P_T * (dLdP_T - Delta[None,:]) * ln2) # (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        # 等价于 weighted_dLdP = tl.sum(dLdP * P, axis=1)
+        #        dLdS = P * (dLdP - weighted_dLdP[:,None])
+        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # (BLOCK_SIZE_COL, Dh)
+
+        offsets_row += BLOCK_SIZE_ROW
+        Q_ptr += BLOCK_SIZE_ROW * stride_N
+        dLdO_ptr += BLOCK_SIZE_ROW * stride_N
+
+    return dLdK, dLdV
+
+@triton.jit
+def _attn_bwd_Q(
+    dLdQ, Q, dLdO, LSE, 
+    K_ptr, V_ptr, Delta_ptr,
+    stride_N, stride_Dh,
+    H, N, Dh: tl.constexpr,
+    BLOCK_SIZE_ROW: tl.constexpr, 
+    BLOCK_SIZE_COL: tl.constexpr,
+    start_row, start_col, num_steps,
+    scale, ln2: tl.constexpr, rln2: tl.constexpr,
+    DIAGONAL: tl.constexpr
+    ):
+    offsets_row = start_row + tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_col = start_col + tl.arange(0, BLOCK_SIZE_COL)
+    offsets_Dh = tl.arange(0, Dh)
+
+    KV_T_offsets = offsets_Dh[:,None] * stride_Dh + offsets_col[None,:] * stride_N
+    
+    Delta = tl.load(Delta_ptr + offsets_row, mask=offsets_row<N, other=0.0)
+
+    for block_idx in range(num_steps):
+        KV_mask = (offsets_col < N)[None,:]
+        K_T = tl.load(K_ptr + KV_T_offsets, mask=KV_mask, other=0.0)
+        V_T = tl.load(V_ptr + KV_T_offsets, mask=KV_mask, other=0.0)
+
+        S = tl.dot(Q, K_T) # (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        P = tl.exp2(S - LSE) # (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        
+        if DIAGONAL:
+            P = tl.where(offsets_row[:,None]>=offsets_col[None,:], P, 0.0)
+        
+        dLdP = tl.dot(dLdO, V_T) # (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdS = (P * (dLdP - Delta[:,None]) * ln2) # (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdQ = tl.dot(dLdS, tl.trans(K_T), acc=dLdQ) # (BLOCK_SIZE_ROW, Dh)
+
+        offsets_col += BLOCK_SIZE_COL
+        K_ptr += BLOCK_SIZE_COL * stride_N
+        V_ptr += BLOCK_SIZE_COL * stride_N
+        
+    return dLdQ
+
+@triton.autotune(
+    [
+        triton.Config({"BLOCK_SIZE_MACRO": BLOCK_SIZE_MACRO, "BLOCK_SIZE_MICRO": BLOCK_SIZE_MICRO},
+                        num_stages=num_stages, num_warps=num_warps,)
+        for BLOCK_SIZE_MICRO in [16]#, 32, 64]
+        for BLOCK_SIZE_MACRO in [32]#, 64, 128]
+        for num_stages in [3]#, 5, 7]
+        for num_warps in [4]#, 8, 16]
+        if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
+    ],
+    key=["Dh"],
+)
+@triton.jit
+def attn_backward(
+    Q_ptr, K_ptr, V_ptr, 
+    dLdO_ptr, dLdQ_ptr, dLdK_ptr, dLdV_ptr,
+    LSE_ptr, Delta_ptr,
+    scale,
+    stride_B, stride_H, stride_N, stride_Dh,
+    H, N, Dh: tl.constexpr, 
+    BLOCK_SIZE_MICRO: tl.constexpr, BLOCK_SIZE_MACRO: tl.constexpr,
+    ):
+    ln2: tl.constexpr = 0.6931471824645996  # = ln(2), natural logarithm of 2
+    rln2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2), the reciprocal of the natural logarithm of 2
+
+    index_BH = tl.program_id(axis=1)
+    index_B = index_BH // H
+    index_H = index_BH % H
+    BH_jump = index_B * stride_B + index_H * stride_H
+    Q_ptr += BH_jump
+    K_ptr += BH_jump
+    V_ptr += BH_jump
+    dLdO_ptr += BH_jump
+    dLdQ_ptr += BH_jump
+    dLdK_ptr += BH_jump
+    dLdV_ptr += BH_jump
+
+    BH_jump = index_BH * N
+    LSE_ptr += BH_jump
+    Delta_ptr += BH_jump
+
+    tl.static_assert(BLOCK_SIZE_MACRO % BLOCK_SIZE_MICRO == 0)
+
+    # stage 1: dLdK and dLdV
+    # in the fwd loop we held a block of Q in SRAM and iterated through K & V; here we'll do the opposite
+    BLOCK_SIZE_ROW_1: tl.constexpr = BLOCK_SIZE_MICRO
+    BLOCK_SIZE_COL_1: tl.constexpr = BLOCK_SIZE_MACRO
+
+    pid = tl.program_id(axis=0)
+    start_col = pid * BLOCK_SIZE_COL_1
+    start_row = start_col
+    num_steps = BLOCK_SIZE_COL_1 // BLOCK_SIZE_ROW_1
+
+    offsets_col_1 = start_col + tl.arange(0, BLOCK_SIZE_COL_1)
+    offsets_Dh = tl.arange(0,Dh)
+    KV_offsets = offsets_col_1[:,None] * stride_N + offsets_Dh * stride_Dh
+    KV_mask = offsets_col_1[:,None] < N
+    K = tl.load(K_ptr + KV_offsets, mask=KV_mask, other=0.0)
+    V = tl.load(V_ptr + KV_offsets, mask=KV_mask, other=0.0)
+    K *= scale * rln2
+
+    dLdK = tl.zeros([BLOCK_SIZE_COL_1,Dh], dtype=tl.float32)
+    dLdV = tl.zeros([BLOCK_SIZE_COL_1,Dh], dtype=tl.float32)
+
+    dLdK, dLdV = _attn_bwd_KV(
+        K,V,dLdK,dLdV,
+        Q_ptr,dLdO_ptr,LSE_ptr,Delta_ptr,
+        stride_N,stride_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_1,BLOCK_SIZE_COL_1,
+        start_row,start_col,num_steps,
+        scale,ln2,rln2,
+        DIAGONAL=True
+    )
+
+    start_row += BLOCK_SIZE_MACRO
+    N_adj = tl.cdiv(N, BLOCK_SIZE_COL_1) * BLOCK_SIZE_COL_1
+    num_steps = (N_adj - start_row) // BLOCK_SIZE_MICRO
+
+    dLdK, dLdV = _attn_bwd_KV(
+        K,V,dLdK,dLdV,
+        Q_ptr,dLdO_ptr,LSE_ptr,Delta_ptr,
+        stride_N,stride_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_1,BLOCK_SIZE_COL_1,
+        start_row,start_col,num_steps,
+        scale,ln2,rln2,
+        DIAGONAL=False
+    )
+
+    dLdK *= scale * rln2
+    tl.store(dLdK_ptr + KV_offsets, dLdK, mask=KV_mask)
+    tl.store(dLdV_ptr + KV_offsets, dLdV, mask=KV_mask)
+
+    # stage 2: dLdQ
+     # in this part, like the forward pass we look at a specific block of Q & iterate through K & V
+    BLOCK_SIZE_ROW_2: tl.constexpr = BLOCK_SIZE_MACRO
+    BLOCK_SIZE_COL_2: tl.constexpr = BLOCK_SIZE_MICRO
+
+    start_row = pid * BLOCK_SIZE_ROW_2
+    start_col = start_row
+    num_steps = BLOCK_SIZE_ROW_2 // BLOCK_SIZE_COL_2
+
+    offsets_row = start_row + tl.arange(0, BLOCK_SIZE_ROW_2)
+    QO_offsets = offsets_row[:,None] * stride_N + offsets_Dh[None,:] * stride_Dh
+    mask_row = offsets_row < N
+    Q = tl.load(Q_ptr + QO_offsets, mask=mask_row[:,None], other=0.0)
+    Q *= scale * rln2
+    dLdO = tl.load(dLdO_ptr + QO_offsets, mask=mask_row[:,None], other=0.0)
+    LSE = tl.load(LSE_ptr + offsets_row, mask=mask_row, other=0.0)[:,None]
+
+    dLdQ = tl.zeros([BLOCK_SIZE_ROW_2, Dh], dtype=tl.float32)
+
+    dLdQ = _attn_bwd_Q(
+        dLdQ, Q, dLdO, LSE, 
+        K_ptr, V_ptr, Delta_ptr, 
+        stride_N, stride_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2,
+        start_row, start_col, num_steps,
+        scale, ln2, rln2,
+        DIAGONAL=True
+    )
+    
+    end_col = start_col
+    start_col = 0 # end_COL - num_steps * BLOCK_SIZE_COL_2 # could just call it 0 lmao
+    num_steps = end_col // BLOCK_SIZE_COL_2
+
+    dLdQ = _attn_bwd_Q(
+        dLdQ, Q, dLdO, LSE, 
+        K_ptr, V_ptr, Delta_ptr, 
+        stride_N, stride_Dh,
+        H, N, Dh,
+        BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2,
+        start_row, start_col, num_steps,
+        scale, ln2, rln2,
+        DIAGONAL=False
+    )
+
+    dLdQ *= scale * rln2
+    tl.store(dLdQ_ptr + QO_offsets, dLdQ, mask=mask_row[:, None])
+
+
 class _flashattention(torch.autograd.Function):
     @staticmethod
     def forward(ctx,q,k,v,scale):
@@ -195,8 +464,44 @@ class _flashattention(torch.autograd.Function):
         ctx.B,ctx.H,ctx.N,ctx.Dh = B,H,N,Dh
         ctx.scale = scale
         return O
+    @staticmethod
+    def backward(ctx,dLdO):
+        q,k,v,O,LSE = ctx.saved_tensors
+        grid = ctx.grid
+        scale = ctx.scale
+        B,H,N,Dh = ctx.B,ctx.H,ctx.N,ctx.Dh
+
+        dLdq = torch.empty_like(q)
+        dLdk = torch.empty_like(k)
+        dLdv = torch.empty_like(v)
+        dLdO = dLdO.contiguous()
+        assert q.stride() == k.stride() == v.stride() == O.stride() == dLdO.stride()
+
+        Delta = torch.empty_like(LSE) # shape(B,H,N)
+
+        pre_grid = lambda meta: (triton.cdiv(N, meta["PRE_BLOCK_SIZE_ROW"]), B*H)
+        attn_backward_preprocess[pre_grid](
+            O, dLdO, Delta,
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            dLdO.stride(0), dLdO.stride(1), dLdO.stride(2), dLdO.stride(3),
+            Delta.stride(0), Delta.stride(1), Delta.stride(2),
+            N, Dh,
+        )
+
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_MACRO"]), B * H) 
+        attn_backward[grid](
+            q, k, v,
+            dLdO, dLdq, dLdk, dLdv,
+            LSE, Delta,
+            scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), # all tensors should share same stride
+            H, N, Dh,
+        )
+
+        return dLdq, dLdk, dLdv, None
 
 triton_attention = _flashattention.apply
+
 
 def test_flashattention_kernel(B,H,N,Dh, device=DEVICE, atol=5e-3):
     q = torch.randn((B,H,N,Dh), dtype=torch.float32, device=DEVICE, requires_grad=True)
@@ -208,9 +513,24 @@ def test_flashattention_kernel(B,H,N,Dh, device=DEVICE, atol=5e-3):
     torch.testing.assert_close(tri_out,ref_out,atol=atol,rtol=0)
     print("PASSED forward")
 
+    # triton backward pass
+    dLdout = 0.1 * torch.randn_like(q)
+    tri_out.backward(dLdout, retain_graph=True)
+    dLdq_tri,dLdk_tri,dLdv_tri = [_.grad.clone() for _ in [q,k,v]]
+    q.grad,k.grad,v.grad = None,None,None # 手动清空梯度缓存
+    # pytorch
+    ref_out.backward(dLdout, retain_graph=True)
+    dLdq_ref,dLdk_ref,dLdv_ref = [_.grad.clone() for _ in [q,k,v]]
+    q.grad,k.grad,v.grad = None,None,None
+
+    torch.testing.assert_close(dLdq_tri,dLdq_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdk_tri,dLdk_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdv_tri,dLdv_ref, atol=atol, rtol=0)
+    print("PASSED backward")
+
 # vary seq length for fixed head and batch=4
 configs = []
-for mode in ["fwd"]: # , "bwd"
+for mode in ["fwd", "bwd"]: 
     configs.append(
         triton.testing.Benchmark(
             x_names=["SEQ_LEN"],
